@@ -1,0 +1,331 @@
+import numpy as np
+import pandas as pd
+import torch
+import logging
+import math
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import torch.utils.data as data_utils
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from model.mlp import CardMLP
+from utils.misc import three_sigma, accuracy1, set_seed, get_cosine_schedule_with_warmup, interleave, de_interleave
+import torch.nn.functional as F
+import jenkspy
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, precision_score, recall_score
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
+data = pd.read_csv('/home/parnec/wxr/dataset/creditcard/creditcard.csv')
+x = data.iloc[:, :-1].values
+y = data.iloc[:, -1].values
+y = 1-y
+sc = StandardScaler()
+x = sc.fit_transform(x)
+positive_index = np.where(y == 0)[0]
+
+negative_index = np.where(y == 1)[0]
+# print(len(positive_index))
+labeled_train_index = np.random.choice(positive_index, 100, False)
+positive_index = np.setdiff1d(positive_index, labeled_train_index)
+positive_test_index = np.random.choice(positive_index, 100, False)
+unlabeled_positive_index = np.setdiff1d(positive_index, positive_test_index)
+
+unlabeled_negative_index = np.random.choice(negative_index, 8008, False)
+negative_index = np.setdiff1d(negative_index, unlabeled_negative_index)
+test_negative_index = np.random.choice(negative_index, 2000, False)
+
+labeled_x = x[labeled_train_index]
+labeled_y = y[labeled_train_index]
+
+unlabeled_x = np.append(x[unlabeled_negative_index], x[unlabeled_positive_index],axis=0)
+unlabeled_y_t = np.append(y[unlabeled_negative_index], y[unlabeled_positive_index])
+print(unlabeled_y_t.sum())
+unlabeled_y_u = np.ones(len(unlabeled_y_t))
+
+
+x_test = np.append(x[test_negative_index], x[positive_test_index], axis=0)
+y_test = np.append(y[test_negative_index], y[positive_test_index])
+print(np.where(y_test==0))
+
+p_data = torch.from_numpy(labeled_x)
+p_label = torch.from_numpy(labeled_y).double()
+u_data = torch.from_numpy(unlabeled_x)
+u_label_u = torch.from_numpy(unlabeled_y_u).double()
+u_label_t = torch.from_numpy(unlabeled_y_t).double()
+t_data = torch.from_numpy(x_test)
+t_label = torch.from_numpy(y_test).double()
+
+
+
+
+postive_set = data_utils.TensorDataset(p_data, p_label)
+unlabeled_set = data_utils.TensorDataset(u_data, u_label_u, u_label_t)
+test_set = data_utils.TensorDataset(t_data, t_label)
+print(len(postive_set), len(unlabeled_set), len(test_set))
+labeled_trainloader = DataLoader(postive_set, sampler=SequentialSampler(postive_set), batch_size=50, shuffle=False)
+unlabeled_trainloader = DataLoader(unlabeled_set, batch_size=50, sampler=SequentialSampler(unlabeled_set), shuffle=False, drop_last=True)
+testloader = DataLoader(test_set, batch_size=2100, sampler=SequentialSampler(test_set), shuffle=False, drop_last=True)
+
+# train_phase1 每练完一次epoch就对所有未标记样本进行一次预测，然后综合所有epoch的预测结果最终得到未标记样本点的预测趋势
+def train_phase1(device, model, optimizer):
+    global in_constraint_weight
+    global ce_constraint_weight
+    global lam
+    global lam2
+    train_accuracies = []
+    
+    num_classes = 4
+
+    losses_ce = []
+    in_losses = []
+    out_losses = []
+    out_losses_weighted = []
+    losses = []
+
+    labeled_iter = iter(labeled_trainloader)
+    unlabeled_iter = iter(unlabeled_trainloader)
+    global preds_sequence, targets
+    model.train()
+    for epoch in range(0, 10):
+
+        for batch_idx in range(500):
+            try:
+                inputs_p, targets_p = labeled_iter.next()
+            except:
+                labeled_iter = iter(labeled_trainloader)
+                inputs_p, targets_p = labeled_iter.next()
+            try:
+                inputs_u, targets_u, targets_t = unlabeled_iter.next()
+            except:
+                unlabeled_iter = iter(unlabeled_trainloader)
+                inputs_u, targets_u, targets_t = unlabeled_iter.next()
+            batch_size = inputs_p.shape[0]
+            inputs = interleave(torch.cat((inputs_p, inputs_u)), 2).to(device)
+            targets_p = targets_p.to(device)
+            targets_u = targets_u.to(device)
+            targets_t = targets_t.to(device)
+            logits = model(inputs)
+
+            logits = de_interleave(logits, 2)
+            logits_p, logits_u = logits.chunk(2)
+
+
+            #现在往这加入新的损失函数
+
+            x_classification = logits[:len(positive_set[0]), :num_classes]
+            target = positive_set[1]
+            pred = x_classification.data.max(1)[1]
+            train_accuracies.append(accuracy_score(list(to_np(pred)), list(to_np(target))))
+
+    
+            #Lx = F.cross_entropy(logits_p, targets_p.long(), reduction='mean', label_smoothing=0)
+            #Lu = F.cross_entropy(logits_u, targets_u.long(), reduction='mean', label_smoothing=0)
+            #loss = Lx + Lu
+            optimizer.zero_grad()
+            if args.classification:
+                loss_ce = F.cross_entropy(x_classification, target)
+            else:
+                loss_ce = torch.Tensor([0]).cuda()
+            
+            losses_ce.append(loss_ce.item())
+            #########
+            out_x_ood_task = logits[len(in_set[0]):, num_classes]
+            out_loss = torch.mean(F.relu(1 - out_x_ood_task))
+            out_loss_weighted = args.out_constraint_weight * out_loss
+
+            in_x_ood_task = logits[:len(in_set[0]), num_classes]
+            f_term = torch.mean(F.relu(1 + in_x_ood_task)) - args.false_alarm_cutoff
+            if in_constraint_weight * f_term + lam >= 0:
+                in_loss = f_term * lam + in_constraint_weight / 2 * torch.pow(f_term, 2)
+            else:
+                in_loss = - torch.pow(lam, 2) * 0.5 / in_constraint_weight
+
+            loss_ce_constraint = loss_ce - args.ce_tol * full_train_loss
+            if ce_constraint_weight * loss_ce_constraint + lam2 >= 0:
+                loss_ce = loss_ce_constraint * lam2 + ce_constraint_weight / 2 * torch.pow(loss_ce_constraint, 2)
+            else:
+                loss_ce = - torch.pow(lam2, 2) * 0.5 / ce_constraint_weight
+
+            # add the losses together
+            loss = out_loss_weighted + (in_loss)
+            loss = loss
+            in_losses.append(in_loss.item())
+            out_losses.append(out_loss.item())
+            out_losses_weighted.append(out_loss.item())
+            losses.append(loss.item())
+            ########
+
+            loss.backward()
+            optimizer.step()
+
+            #######上面是每一个epoch训练好，最后下面的要记录每个epoch预测的咋样了，根据这个打标签
+            #######现在更新lagrange 算子
+            #######现在开始更新lam1
+            in_term, ce_loss = compute_constraint_terms()
+            in_term_constraint = in_term - args.false_alarm_cutoff
+            if in_term_constraint * in_constraint_weight + lam >= 0:
+                lam += args.lr_lam * in_term_constraint
+            else:
+                lam += -args.lr_lam * lam / in_constraint_weight
+
+            #######现在开始更新lam2
+            ce_constraint = ce_loss - args.ce_tol * full_train_loss
+            if ce_constraint * ce_constraint_weight + lam2 >= 0:
+                lam2 += args.lr_lam * ce_constraint
+            else:
+                lam2 += -args.lr_lam * lam2 / ce_constraint_weight
+
+
+
+
+        with torch.no_grad():
+            preds = np.array(batch_size)
+            for batch_idx, (inputs, targets_u, targets_t) in enumerate(unlabeled_trainloader):
+                model.eval()
+                inputs = inputs.to(device)
+                outputs = model(inputs)
+                softmax = torch.nn.Softmax(dim=1)
+                pred = softmax(outputs)
+                pred = np.array((pred[:, 0]).cpu())
+                if batch_idx == 0:
+                    preds = pred
+                    targets = targets_t
+                else:
+                    preds = np.concatenate([preds, pred], axis=0)
+                    targets = np.concatenate([targets, targets_t], axis=0)
+        if epoch == 0:
+            preds_sequence = preds
+
+        else:
+            preds_sequence = np.vstack((preds_sequence, preds))
+
+    #######开始计算伪标签了
+    preds_sequence = preds_sequence.T
+    trends = np.zeros(len(preds_sequence))
+    for i, sequence in enumerate(preds_sequence):
+        sequence = pd.Series(sequence)
+        diff_1 = sequence.diff(periods=1)
+        diff_1 = np.array(diff_1)
+        diff_1 = diff_1[1:]
+        diff_1 = np.log(1 + diff_1 + 0.5 * diff_1 ** 2)
+        trends[i] = diff_1.mean()
+    # print(np.min(trends), np.max(trends), trends.mean())
+    intervals = jenkspy.jenks_breaks(trends, n_classes=2)
+    break_point = intervals[1]
+    # if break_point > 0:
+    #     trends_std = three_sigma(trends)
+    #     intervals = jenkspy.jenks_breaks(trends_std, n_classes=2)
+    #     break_point = intervals[1]
+    print(f"The interval is {intervals}; Break Point is {break_point}")
+    pseudo_targets = np.where(trends > break_point, 0, 1)
+    acc = accuracy_score(targets, pseudo_targets)
+    f1 = f1_score(targets, pseudo_targets)
+    prec = precision_score(targets, pseudo_targets)
+    recall = recall_score(targets, pseudo_targets)
+    print('acc', acc, 'f1', f1, 'prec', prec, 'recall', recall, 'estimated prior', 1 - pseudo_targets.sum()/8400)
+    return pseudo_targets
+
+#########在这里加入计算拉格朗日算子
+def compute_constraint_terms(model):
+    '''
+
+    Compute the in-distribution term and the cross-entropy loss over the whole training set
+    '''
+        model.eval()
+        num_classes = 4
+        # create list for the in-distribution term and the ce_loss
+        in_terms = []
+        ce_losses = []
+        num_batches = 0
+        for in_set in labeled_trainloader:
+            num_batches += 1
+            data = in_set[0]
+            target = in_set[1]
+
+            if args.ngpu > 0:
+                data, target = data.cuda(), target.cuda()
+
+             # forward
+            model(data)
+            z = model(data)
+
+            # compute in-distribution term
+            in_x_ood_task = z[:, num_classes]
+            in_terms.extend(list(to_np(F.relu(1 + in_x_ood_task))))
+
+            # compute cross entropy term
+            z_classification = z[:, :num_classes]
+            loss_ce = F.cross_entropy(z_classification, target, reduction='none')
+            ce_losses.extend(list(to_np(loss_ce)))
+
+        return np.mean(np.array(in_terms)), np.mean(np.array(ce_losses))
+
+
+def train(device, model, optimizer, pseudo_targets):
+    unlabeled_num = len(pseudo_targets)
+    labeled_iter = iter(labeled_trainloader)
+    unlabeled_iter = iter(unlabeled_trainloader)
+    global preds_sequence
+    model.train()
+    unlabeled_idx = 0
+    for epoch in range(0, 30):
+
+        for batch_idx in range(500):
+            try:
+                inputs_p, targets_p = labeled_iter.next()
+            except:
+                labeled_iter = iter(labeled_trainloader)
+                inputs_p, targets_p = labeled_iter.next()
+            try:
+                inputs_u, targets_u, targets_t = unlabeled_iter.next()
+            except:
+                unlabeled_iter = iter(unlabeled_trainloader)
+                inputs_u, targets_u, targets_t = unlabeled_iter.next()
+            batch_size = inputs_p.shape[0]
+            inputs = interleave(torch.cat((inputs_p, inputs_u)), 2).to(device)
+            targets_p = targets_p.to(device)
+            targets_u = targets_u.to(device)
+            targets_t = targets_t.to(device)
+            targets_pseudo = pseudo_targets[unlabeled_idx: unlabeled_idx + batch_size]
+            unlabeled_idx = (unlabeled_idx + batch_size) % unlabeled_num
+            targets_pseudo = torch.tensor(targets_pseudo)
+            targets_pseudo = targets_pseudo.to(torch.long).to(device)
+            logits = model(inputs)
+            logits = de_interleave(logits, 2)
+            logits_p, logits_u = logits.chunk(2)
+            Lx = F.cross_entropy(logits_p, targets_p.long(), reduction='mean', label_smoothing=0)
+            Lu = F.cross_entropy(logits_u, targets_pseudo.long(), reduction='mean', label_smoothing=0)
+            loss = Lx + Lu
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        # test
+        test_model = model
+
+
+        with torch.no_grad():
+            for batch_idx, (inputs, targets) in enumerate(testloader):
+                test_model.eval()
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+                outputs = test_model(inputs)
+                acc, auc, f1, prec, recall = accuracy1(outputs, targets)
+                print(batch_idx)
+                print(acc, auc, f1, prec, recall)
+
+
+if __name__ == '__main__':
+    device = torch.device('cuda', 0)
+    model = CardMLP().double()
+    optimizer = torch.optim.SGD(params=model.parameters(), lr=0.001, momentum=0.9, nesterov=True)
+    model.to(device)
+    print('Training phase 1:')
+    pseudo_targets = train_phase1(device, model, optimizer)
+    del model, optimizer
+    print('Fine tuning phase:')
+    model = CardMLP().double()
+    optimizer = torch.optim.SGD(params=model.parameters(), lr=0.001, momentum=0.9, nesterov=True)
+    model.to(device)
+    train(device, model, optimizer, pseudo_targets)
+
+
